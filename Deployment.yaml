@@ -1,0 +1,327 @@
+# ============================================================
+# Namespace
+# ============================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    environment: production
+
+---
+# ============================================================
+# Service Account
+# ============================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: myapp-service-account
+  namespace: production
+automountServiceAccountToken: false
+
+---
+# ============================================================
+# ConfigMap
+# Non-sensitive application configuration
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: myapp-config
+  namespace: production
+data:
+  APP_ENV: "production"
+  LOG_LEVEL: "INFO"
+  SERVER_PORT: "8080"
+
+---
+# ============================================================
+# Deployment
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp
+  namespace: production
+  labels:
+    app: myapp
+    environment: production
+
+spec:
+  # Remove replicas when HPA fully manages scaling.
+  # Keeping 3 here provides an initial highly available baseline.
+  replicas: 3
+
+  revisionHistoryLimit: 5
+
+  minReadySeconds: 10
+
+  progressDeadlineSeconds: 600
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # No reduction in available replicas during deployment.
+      maxUnavailable: 0
+
+      # Allow one additional Pod during deployment.
+      maxSurge: 1
+
+  selector:
+    matchLabels:
+      app: myapp
+
+  template:
+    metadata:
+      labels:
+        app: myapp
+        environment: production
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "8080"
+
+    spec:
+      serviceAccountName: myapp-service-account
+
+      # Do not automatically mount Kubernetes API credentials.
+      automountServiceAccountToken: false
+
+      terminationGracePeriodSeconds: 30
+
+      # Spread Pods across different nodes.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: myapp
+
+      # Prefer different availability zones when available.
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: myapp
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: myapp
+
+          # Use an immutable version or image digest in production.
+          image: your-registry.example.com/myapp:1.0.0
+
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: myapp-config
+
+          # Example secret variables.
+          # Create myapp-secret separately.
+          env:
+            - name: DATABASE_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: myapp-secret
+                  key: database-username
+
+            - name: DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: myapp-secret
+                  key: database-password
+
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+              ephemeral-storage: "256Mi"
+
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+              ephemeral-storage: "1Gi"
+
+          # Gives slow applications time to start.
+          startupProbe:
+            httpGet:
+              path: /health/startup
+              port: http
+              scheme: HTTP
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 30
+            successThreshold: 1
+
+          # Determines whether the Pod can receive traffic.
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+            successThreshold: 1
+
+          # Restarts the container when it becomes unhealthy.
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 2
+            failureThreshold: 3
+            successThreshold: 1
+
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - sleep 10
+
+          securityContext:
+            allowPrivilegeEscalation: false
+
+            capabilities:
+              drop:
+                - ALL
+
+            privileged: false
+
+            readOnlyRootFilesystem: true
+
+          volumeMounts:
+            - name: temp-volume
+              mountPath: /tmp
+
+            - name: cache-volume
+              mountPath: /app/cache
+
+      volumes:
+        - name: temp-volume
+          emptyDir:
+            sizeLimit: 256Mi
+
+        - name: cache-volume
+          emptyDir:
+            sizeLimit: 256Mi
+
+---
+# ============================================================
+# ClusterIP Service
+# ============================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: myapp-service
+  namespace: production
+  labels:
+    app: myapp
+
+spec:
+  type: ClusterIP
+
+  selector:
+    app: myapp
+
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: http
+
+---
+# ============================================================
+# Pod Disruption Budget
+# Protects availability during voluntary disruptions such as
+# node maintenance and kubectl drain.
+# ============================================================
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: myapp-pdb
+  namespace: production
+
+spec:
+  minAvailable: 2
+
+  selector:
+    matchLabels:
+      app: myapp
+
+---
+# ============================================================
+# Horizontal Pod Autoscaler
+# Requires Metrics Server
+# ============================================================
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: myapp-hpa
+  namespace: production
+
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: myapp
+
+  minReplicas: 3
+  maxReplicas: 10
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+
+        - type: Pods
+          value: 4
+          periodSeconds: 60
+
+      selectPolicy: Max
+
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75
